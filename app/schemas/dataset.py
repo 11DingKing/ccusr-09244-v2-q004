@@ -176,6 +176,8 @@ class DatasetVersionResponse(BaseModel):
     data_grade: Optional[str] = None
     created_by: Optional[str] = None
     created_at: datetime
+    is_active: bool = True
+    revoked_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -224,3 +226,44 @@ class ReviewStatusStats(BaseModel):
     approved: int = 0
     rejected: int = 0
     published: int = 0
+
+
+class DatasetNotificationResponse(BaseModel):
+    id: int
+    dataset_id: int
+    dataset_version_id: int
+    subscriber_team: str
+    contact_person: Optional[str] = None
+    notification_type: str
+    message: Optional[str] = None
+    status: str
+    created_at: datetime
+    cancelled_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ActiveVersionInfo(BaseModel):
+    """撤回到达终态（被阻止或幂等命中）时返回的当前有效版本。"""
+
+    version_id: Optional[int] = None
+    version_number: Optional[int] = None
+    version_label: Optional[str] = None
+    is_published: bool = False
+    review_status: str
+
+
+class DatasetRevokeResponse(BaseModel):
+    success: bool
+    idempotent: bool = False
+    reason: Optional[str] = None
+    dataset_id: int
+    review_status: str
+    is_published: bool
+    revoked_version_id: Optional[int] = None
+    active_version: Optional[ActiveVersionInfo] = None
+    reuse_count: int = 0
+    reused_by_teams: List[str] = []
+    cancelled_notification_count: int = 0
+    review: Optional[DatasetReviewResponse] = None

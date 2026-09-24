@@ -6,17 +6,23 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import (
     Dataset, DatasetItem, DatasetReuse,
-    DatasetVersion, DatasetReview, DatasetSubscription,
+    DatasetVersion, DatasetReview, DatasetSubscription, DatasetNotification,
     OperationData, Annotation, RobotModel, Scene
 )
 from app.services.aggregation import compute_dataset_quality_stats
+from app.services.review import (
+    DatasetRevokeError,
+    RevokeResult,
+    revoke_dataset,
+)
 from app.schemas.dataset import (
     DatasetCreate, DatasetUpdate, DatasetResponse,
     DatasetItemAddRequest, DatasetItemRemoveRequest,
     DatasetReuseCreate, DatasetReuseResponse,
     DatasetVersionCreate, DatasetVersionResponse,
     DatasetReviewAction, DatasetReviewResponse,
-    DatasetSubscriptionCreate, DatasetSubscriptionResponse
+    DatasetSubscriptionCreate, DatasetSubscriptionResponse,
+    DatasetNotificationResponse, DatasetRevokeResponse, ActiveVersionInfo,
 )
 
 router = APIRouter()
@@ -77,7 +83,13 @@ def _create_version_snapshot(db: Session, dataset: Dataset, change_description: 
     return version
 
 
-def _notify_subscribers(db: Session, dataset: Dataset, version: DatasetVersion):
+def _notify_subscribers(db: Session, dataset: Dataset, version: DatasetVersion) -> List[dict]:
+    """为订阅方落库待发送通知，返回通知内容。
+
+    通知持久化在同一事务内：发布若最终未提交，通知不会残留；
+    撤回时这些 pending 通知可在同一事务中取消。
+    (dataset, version, subscriber_team) 上有唯一约束，重复触发不会新增。
+    """
     subscriptions = db.query(DatasetSubscription).filter(
         DatasetSubscription.dataset_id == dataset.id,
         DatasetSubscription.notify_on_new_version == True
@@ -85,15 +97,58 @@ def _notify_subscribers(db: Session, dataset: Dataset, version: DatasetVersion):
 
     notifications = []
     for sub in subscriptions:
+        message = f"数据集 '{dataset.name}' 已发布新版本 {version.version_label}"
+        existing = db.query(DatasetNotification).filter(
+            DatasetNotification.dataset_id == dataset.id,
+            DatasetNotification.dataset_version_id == version.id,
+            DatasetNotification.subscriber_team == sub.subscriber_team,
+        ).first()
+        if existing is None:
+            db.add(DatasetNotification(
+                dataset_id=dataset.id,
+                dataset_version_id=version.id,
+                subscriber_team=sub.subscriber_team,
+                contact_person=sub.contact_person,
+                notification_type="new_version",
+                message=message,
+                status="pending",
+            ))
         notifications.append({
             "subscriber_team": sub.subscriber_team,
             "contact_person": sub.contact_person,
             "dataset_id": dataset.id,
             "dataset_name": dataset.name,
             "new_version": version.version_label,
-            "message": f"数据集 '{dataset.name}' 已发布新版本 {version.version_label}"
+            "message": message
         })
     return notifications
+
+
+def _revoke_response(result: RevokeResult) -> DatasetRevokeResponse:
+    active = result.active_version
+    return DatasetRevokeResponse(
+        success=result.success,
+        idempotent=result.idempotent,
+        reason=result.reason,
+        dataset_id=result.dataset_id,
+        review_status=result.review_status,
+        is_published=result.is_published,
+        revoked_version_id=result.revoked_version_id,
+        active_version=ActiveVersionInfo(
+            version_id=active.id,
+            version_number=active.version_number,
+            version_label=active.version_label,
+            is_published=result.is_published,
+            review_status=result.review_status,
+        ) if active else ActiveVersionInfo(
+            is_published=result.is_published,
+            review_status=result.review_status,
+        ),
+        reuse_count=result.reuse_count,
+        reused_by_teams=result.reused_by_teams,
+        cancelled_notification_count=result.cancelled_notification_count,
+        review=DatasetReviewResponse.model_validate(result.review) if result.review else None,
+    )
 
 
 @router.get("/datasets", response_model=List[DatasetResponse], tags=["数据集管理"])
@@ -286,7 +341,11 @@ def remove_items_from_dataset(dataset_id: int, req: DatasetItemRemoveRequest, db
     return dataset
 
 
-@router.post("/datasets/{dataset_id}/review", response_model=DatasetReviewResponse, tags=["数据集审核"])
+@router.post(
+    "/datasets/{dataset_id}/review",
+    response_model=DatasetReviewResponse | DatasetRevokeResponse,
+    tags=["数据集审核"],
+)
 def review_dataset(dataset_id: int, req: DatasetReviewAction, db: Session = Depends(get_db)):
     dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
     if not dataset:
@@ -294,6 +353,31 @@ def review_dataset(dataset_id: int, req: DatasetReviewAction, db: Session = Depe
 
     if req.action not in VALID_REVIEW_ACTIONS:
         raise HTTPException(status_code=400, detail=f"无效的审核动作，允许值：{', '.join(VALID_REVIEW_ACTIONS)}")
+
+    # 撤回的阶段校验（含重复请求幂等）由 review 服务统一处理
+    if req.action == "revoke":
+        try:
+            result = revoke_dataset(db, dataset, reviewer=req.reviewer, review_notes=req.review_notes)
+        except DatasetRevokeError as exc:
+            db.rollback()
+            blocked = exc.result
+            raise HTTPException(
+                status_code=409 if blocked.reason == "version_reused" else 400,
+                detail={
+                    "message": blocked.message,
+                    "reason": blocked.reason,
+                    "result": _revoke_response(blocked).model_dump(mode="json"),
+                },
+            )
+        db.commit()
+        db.refresh(dataset)
+        if result.review is not None:
+            db.refresh(result.review)
+        # active_version / dataset 字段以提交后状态为准
+        result.review_status = dataset.review_status
+        result.is_published = bool(dataset.is_published)
+        result.reuse_count = dataset.reuse_count or 0
+        return _revoke_response(result)
 
     if dataset.review_status not in REVIEW_TRANSITIONS.get(req.action, set()):
         raise HTTPException(
@@ -308,7 +392,11 @@ def review_dataset(dataset_id: int, req: DatasetReviewAction, db: Session = Depe
         dataset.is_published = False
 
     elif req.action == "approve":
+        # 批准只产生版本快照并进入 approved；发布由 /publish 完成，
+        # 届时才落库订阅通知，因此存在"已批准未发布"的可撤回阶段。
         dataset.review_status = "approved"
+        dataset.is_published = False
+        dataset.published_at = None
         review = DatasetReview(
             dataset_id=dataset.id,
             action="approve",
@@ -320,20 +408,13 @@ def review_dataset(dataset_id: int, req: DatasetReviewAction, db: Session = Depe
 
         version = _create_version_snapshot(
             db, dataset,
-            change_description=req.review_notes or "审核通过，发布新版本",
+            change_description=req.review_notes or "审核通过，生成待发布版本",
             created_by=req.reviewer
         )
         dataset.current_version = version.version_number
         dataset.version = version.version_label
 
-        dataset.is_published = True
-        dataset.published_at = datetime.now(timezone.utc)
-
         review.dataset_version_id = version.id
-        db.flush()
-
-        db.refresh(dataset)
-        _notify_subscribers(db, dataset, version)
         db.commit()
         db.refresh(review)
         return review
@@ -341,11 +422,6 @@ def review_dataset(dataset_id: int, req: DatasetReviewAction, db: Session = Depe
     elif req.action == "reject":
         dataset.review_status = "rejected"
         dataset.is_published = False
-
-    elif req.action == "revoke":
-        dataset.review_status = "draft"
-        dataset.is_published = False
-        dataset.published_at = None
 
     review = DatasetReview(
         dataset_id=dataset.id,
@@ -380,8 +456,21 @@ def publish_dataset(dataset_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="数据集尚未通过审核，无法发布")
     if dataset.total_items == 0:
         raise HTTPException(status_code=400, detail="数据集为空，无法发布")
+
+    version = (
+        db.query(DatasetVersion)
+        .filter(
+            DatasetVersion.dataset_id == dataset_id,
+            DatasetVersion.version_number == dataset.current_version,
+        )
+        .order_by(DatasetVersion.id.desc())
+        .first()
+    )
     dataset.is_published = True
     dataset.published_at = datetime.now(timezone.utc)
+    if version is not None:
+        # 发布与待发送通知在同一事务内提交
+        _notify_subscribers(db, dataset, version)
     db.commit()
     db.refresh(dataset)
     return dataset
@@ -392,9 +481,16 @@ def unpublish_dataset(dataset_id: int, db: Session = Depends(get_db)):
     dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
     if not dataset:
         raise HTTPException(status_code=404, detail="数据集不存在")
-    dataset.is_published = False
-    dataset.published_at = None
-    dataset.review_status = "draft"
+    # 与撤回共用同一套事务协调：复用拦截、快照失效、通知取消
+    try:
+        revoke_dataset(db, dataset, reviewer=None, review_notes="通过下架接口撤回")
+    except DatasetRevokeError as exc:
+        db.rollback()
+        blocked = exc.result
+        raise HTTPException(
+            status_code=409 if blocked.reason == "version_reused" else 400,
+            detail=blocked.message,
+        )
     db.commit()
     db.refresh(dataset)
     return dataset
@@ -504,6 +600,21 @@ def list_dataset_subscriptions(dataset_id: int, db: Session = Depends(get_db)):
     ).order_by(DatasetSubscription.created_at.desc()).all()
 
 
+@router.get("/datasets/{dataset_id}/notifications", response_model=List[DatasetNotificationResponse], tags=["数据集订阅"])
+def list_dataset_notifications(
+    dataset_id: int,
+    status: Optional[str] = Query(None, description="通知状态过滤：pending/sent/cancelled"),
+    db: Session = Depends(get_db)
+):
+    dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+    if not dataset:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    query = db.query(DatasetNotification).filter(DatasetNotification.dataset_id == dataset_id)
+    if status:
+        query = query.filter(DatasetNotification.status == status)
+    return query.order_by(DatasetNotification.created_at.desc()).all()
+
+
 @router.get("/datasets/{dataset_id}/reuses", response_model=List[DatasetReuseResponse], tags=["数据集复用"])
 def list_dataset_reuses(dataset_id: int, db: Session = Depends(get_db)):
     dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
@@ -527,23 +638,24 @@ def create_dataset_reuse(data: DatasetReuseCreate, db: Session = Depends(get_db)
         ).first()
         if not version:
             raise HTTPException(status_code=400, detail="指定的数据集版本不存在")
+        if not version.is_active:
+            raise HTTPException(status_code=400, detail="指定的数据集版本已撤回失效，无法复用")
     else:
-        latest_version = db.query(DatasetVersion).filter(
-            DatasetVersion.dataset_id == data.dataset_id
-        ).order_by(DatasetVersion.version_number.desc()).first()
-        if latest_version:
-            data_dict = data.model_dump()
-            data_dict["dataset_version_id"] = latest_version.id
-            reuse = DatasetReuse(**data_dict)
-        else:
-            reuse = DatasetReuse(**data.model_dump())
-        db.add(reuse)
-        dataset.reuse_count = (dataset.reuse_count or 0) + 1
-        db.commit()
-        db.refresh(reuse)
-        return reuse
+        # 默认复用当前有效（未撤回）的最新版本
+        version = (
+            db.query(DatasetVersion)
+            .filter(
+                DatasetVersion.dataset_id == data.dataset_id,
+                DatasetVersion.is_active == True,  # noqa: E712
+            )
+            .order_by(DatasetVersion.id.desc())
+            .first()
+        )
 
-    reuse = DatasetReuse(**data.model_dump())
+    reuse_data = data.model_dump()
+    if version is not None:
+        reuse_data["dataset_version_id"] = version.id
+    reuse = DatasetReuse(**reuse_data)
     db.add(reuse)
     dataset.reuse_count = (dataset.reuse_count or 0) + 1
     db.commit()

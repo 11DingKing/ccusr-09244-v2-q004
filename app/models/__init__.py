@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Float, Boolean, JSON
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Float, Boolean, JSON, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -145,6 +145,7 @@ class Dataset(Base):
     versions = relationship("DatasetVersion", back_populates="dataset", cascade="all, delete-orphan")
     reviews = relationship("DatasetReview", back_populates="dataset", cascade="all, delete-orphan")
     subscriptions = relationship("DatasetSubscription", back_populates="dataset", cascade="all, delete-orphan")
+    notifications = relationship("DatasetNotification", back_populates="dataset", cascade="all, delete-orphan")
 
 
 class DatasetItem(Base):
@@ -194,6 +195,9 @@ class DatasetVersion(Base):
     created_by = Column(String(100), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+    is_active = Column(Boolean, default=True, nullable=False, index=True)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+
     dataset = relationship("Dataset", back_populates="versions")
     reuse_records = relationship("DatasetReuse", back_populates="version")
 
@@ -224,3 +228,29 @@ class DatasetSubscription(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     dataset = relationship("Dataset", back_populates="subscriptions")
+
+
+class DatasetNotification(Base):
+    """待发送的订阅通知；撤回时与发布状态在同一事务内取消。"""
+
+    __tablename__ = "dataset_notifications"
+    __table_args__ = (
+        UniqueConstraint(
+            "dataset_id", "dataset_version_id", "subscriber_team",
+            name="uq_dataset_notification_version_team"
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    dataset_id = Column(Integer, ForeignKey("datasets.id"), nullable=False, index=True)
+    dataset_version_id = Column(Integer, ForeignKey("dataset_versions.id"), nullable=False, index=True)
+    subscriber_team = Column(String(100), nullable=False)
+    contact_person = Column(String(100), nullable=True)
+    notification_type = Column(String(30), default="new_version", nullable=False)
+    message = Column(Text, nullable=True)
+    status = Column(String(20), default="pending", nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    cancelled_at = Column(DateTime(timezone=True), nullable=True)
+
+    dataset = relationship("Dataset", back_populates="notifications")
+    version = relationship("DatasetVersion")
