@@ -145,6 +145,7 @@ class Dataset(Base):
     versions = relationship("DatasetVersion", back_populates="dataset", cascade="all, delete-orphan")
     reviews = relationship("DatasetReview", back_populates="dataset", cascade="all, delete-orphan")
     subscriptions = relationship("DatasetSubscription", back_populates="dataset", cascade="all, delete-orphan")
+    notifications = relationship("DatasetNotification", back_populates="dataset", cascade="all, delete-orphan")
 
 
 class DatasetItem(Base):
@@ -194,8 +195,12 @@ class DatasetVersion(Base):
     created_by = Column(String(100), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+    # 版本是否为当前有效快照；撤回审核时随发布标志一并失效，历史快照保留留痕
+    is_active = Column(Boolean, default=True, nullable=False, index=True)
+
     dataset = relationship("Dataset", back_populates="versions")
     reuse_records = relationship("DatasetReuse", back_populates="version")
+    notifications = relationship("DatasetNotification", back_populates="version")
 
 
 class DatasetReview(Base):
@@ -224,3 +229,23 @@ class DatasetSubscription(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     dataset = relationship("Dataset", back_populates="subscriptions")
+
+
+class DatasetNotification(Base):
+    """发布产生的待发送订阅通知；撤回在同一事务内删除，避免发出已撤回版本的通知。"""
+
+    __tablename__ = "dataset_notifications"
+
+    id = Column(Integer, primary_key=True, index=True)
+    dataset_id = Column(Integer, ForeignKey("datasets.id"), nullable=False, index=True)
+    dataset_version_id = Column(Integer, ForeignKey("dataset_versions.id"), nullable=True, index=True)
+    subscriber_team = Column(String(100), nullable=False, index=True)
+    contact_person = Column(String(100), nullable=True)
+    new_version = Column(String(20), nullable=False)
+    message = Column(Text, nullable=False)
+    is_sent = Column(Boolean, default=False, nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    sent_at = Column(DateTime(timezone=True), nullable=True)
+
+    dataset = relationship("Dataset", back_populates="notifications")
+    version = relationship("DatasetVersion", back_populates="notifications")

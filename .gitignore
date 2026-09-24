@@ -19,3 +19,4 @@ __pycache__/
 .mypy_cache/
 vendor/
 .phpunit.result.cache
+.venv/

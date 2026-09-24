@@ -176,9 +176,36 @@ class DatasetVersionResponse(BaseModel):
     data_grade: Optional[str] = None
     created_by: Optional[str] = None
     created_at: datetime
+    is_active: bool = True
 
     class Config:
         from_attributes = True
+
+
+class DatasetNotificationResponse(BaseModel):
+    id: int
+    dataset_id: int
+    dataset_version_id: Optional[int] = None
+    subscriber_team: str
+    contact_person: Optional[str] = None
+    new_version: str
+    message: str
+    is_sent: bool
+    created_at: datetime
+    sent_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class DatasetRevokeBlockedResponse(BaseModel):
+    """撤回被阻止时返回：明确原因 + 阻止撤回的复用信息 + 当前有效版本。"""
+
+    blocked: bool = True
+    reason: str
+    reuse_count: int
+    reuses: List[DatasetReuseResponse]
+    active_version: Optional[DatasetVersionResponse] = None
 
 
 class DatasetReviewAction(BaseModel):
